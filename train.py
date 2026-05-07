@@ -24,7 +24,7 @@ n_mfcc = 15
 BATCH_SIZE = 16
 LR = 1e-3
 MAX_EPOCHS = 100000
-TIME_LIMIT = 20 * 60
+TIME_LIMIT = 15 * 60
 eps = 1e-8
 
 CHECKPOINT_PATH = Path("best_model.pt")

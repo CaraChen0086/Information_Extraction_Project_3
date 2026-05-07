@@ -11,13 +11,6 @@ def ctc_loss_from_logits(
     reduction: str = "mean",
     zero_infinity: bool = True,
 ):
-    """
-    Computes CTC loss from (B,T,N) logits + (B,K) padded targets.
-
-    If your targets_bk includes padding, set target_pad_id and provide target_lengths_b,
-    or omit padding by packing targets yourself.
-    """
-
     if reduction not in {"none", "mean", "sum"}:
         raise ValueError("reduction must be 'none', 'mean', or 'sum'")
 
@@ -25,16 +18,14 @@ def ctc_loss_from_logits(
     batch_size = logits_btn.size(0)
     losses = []
     neg_large = -1e8
+    device = logits_btn.device
 
     for b in range(batch_size):
         input_len = int(input_lengths_b[b].item())
         target_len = int(target_lengths_b[b].item())
 
         if input_len <= 0:
-            loss_b = logits_btn.new_tensor(float("inf"))
-            if target_len == 0:
-                loss_b = logits_btn.new_tensor(0.0)
-            losses.append(loss_b)
+            losses.append(logits_btn.new_tensor(0.0 if target_len == 0 else float("inf")))
             continue
 
         target = targets_bk[b, :target_len].long()
@@ -51,36 +42,42 @@ def ctc_loss_from_logits(
             losses.append(logits_btn.new_tensor(float("inf")))
             continue
 
-        ext_symbols = torch.full(
-            (2 * target_len + 1,),
-            blank_id,
-            dtype=torch.long,
-            device=logits_btn.device,
-        )
+        # Extended symbol sequence: blank s1 blank s2 blank ... sK blank
+        ext_symbols = torch.full((2 * target_len + 1,), blank_id, dtype=torch.long, device=device)
         ext_symbols[1::2] = target
-        num_states = ext_symbols.numel()
+        S = ext_symbols.numel()
 
-        alpha = logits_btn.new_full((input_len, num_states), neg_large)
-        alpha[0, 0] = log_probs[b, 0, blank_id]
-        alpha[0, 1] = log_probs[b, 0, ext_symbols[1]]
+        # Precompute skip mask: can transition from s-2 to s?
+        # Yes if s >= 2, ext_symbols[s] != blank, ext_symbols[s] != ext_symbols[s-2]
+        skip_mask = torch.zeros(S, dtype=torch.bool, device=device)
+        if S >= 3:
+            skip_mask[2:] = (ext_symbols[2:] != blank_id) & (ext_symbols[2:] != ext_symbols[:-2])
+
+        # Initialize: only states 0 and 1 are reachable at t=0
+        alpha = logits_btn.new_full((S,), neg_large)
+        alpha[0] = log_probs[b, 0, blank_id]
+        if S > 1:
+            alpha[1] = log_probs[b, 0, ext_symbols[1]]
+
+        # Forward pass — vectorized over states, sequential over time
+        neg_large_vec = logits_btn.new_full((S,), neg_large)
 
         for t in range(1, input_len):
-            for s in range(num_states):
-                candidates = [alpha[t - 1, s]]
-                if s - 1 >= 0:
-                    candidates.append(alpha[t - 1, s - 1])
-                if (
-                    s - 2 >= 0
-                    and ext_symbols[s] != blank_id
-                    and ext_symbols[s] != ext_symbols[s - 2]
-                ):
-                    candidates.append(alpha[t - 1, s - 2])
+            # Transition from same state
+            t0 = alpha
 
-                prev_score = torch.logsumexp(torch.stack(candidates), dim=0)
-                alpha[t, s] = prev_score + log_probs[b, t, ext_symbols[s]]
+            # Transition from s-1 (pad with -inf on the left)
+            t1 = F.pad(alpha[:-1], (1, 0), value=neg_large)
 
-        log_likelihood = torch.logsumexp(alpha[input_len - 1, -2:], dim=0)
-        if log_likelihood <= neg_large / 2:
+            # Transition from s-2 (pad with two -inf on the left), only where skip is allowed
+            t2_raw = F.pad(alpha[:-2], (2, 0), value=neg_large)
+            t2 = torch.where(skip_mask, t2_raw, neg_large_vec)
+
+            alpha = torch.logsumexp(torch.stack([t0, t1, t2], dim=0), dim=0) \
+                    + log_probs[b, t, ext_symbols]
+
+        log_likelihood = torch.logsumexp(alpha[-2:], dim=0)
+        if log_likelihood.item() <= neg_large / 2:
             losses.append(logits_btn.new_tensor(float("inf")))
         else:
             losses.append(-log_likelihood)
@@ -95,5 +92,4 @@ def ctc_loss_from_logits(
         return loss
     if reduction == "sum":
         return loss.sum()
-
     return loss.mean()
